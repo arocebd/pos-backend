@@ -1,0 +1,10 @@
+Django>=5.0
+djangorestframework
+django-cors-headers
+django-filter
+djangorestframework-simplejwt
+gunicorn
+reportlab
+openpyxl
+Pillow
+
