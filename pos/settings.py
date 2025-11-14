@@ -5,10 +5,8 @@ import os
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# SECRET_KEY Render এর Environment থেকে আসবে
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key")
 
-# Render এর জন্য False রাখছি; লোকালে চাইলে .env এ DEBUG=True দিতে পারেন
 DEBUG = os.getenv("DEBUG", "False") == "True"
 
 ALLOWED_HOSTS = [
@@ -63,7 +61,6 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "pos.wsgi.application"
 
-# 🔥 Render + ডেমোর জন্য আমরা SQLite ব্যবহার করছি
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
