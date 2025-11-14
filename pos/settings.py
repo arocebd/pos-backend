@@ -1,14 +1,15 @@
 # pos/settings.py
 
-import pymysql
-pymysql.install_as_MySQLdb()
+# import pymysql
+# pymysql.install_as_MySQLdb()
 
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = 'your-secret-key'
-DEBUG = True
+import os
+SECRET_KEY = os.getenv("SECRET_KEY")
+DEBUG = False
 ALLOWED_HOSTS = [    
     "localhost",
     "127.0.0.1",
