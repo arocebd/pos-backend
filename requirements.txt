@@ -8,4 +8,3 @@ reportlab
 openpyxl
 Pillow
 pymysql
-jazzmin
