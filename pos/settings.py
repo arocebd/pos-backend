@@ -7,12 +7,10 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key")
 
-DEBUG = os.getenv("DEBUG", "False") == "True"
+DEBUG = False
 
 ALLOWED_HOSTS = [
-    "localhost",
-    "127.0.0.1",
-    "pos-backend-0cog.onrender.com",
+"163.227.239.93"
 ]
 
 INSTALLED_APPS = [
