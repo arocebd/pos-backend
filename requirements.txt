@@ -9,3 +9,5 @@ openpyxl
 Pillow
 pymysql
 whitenoise
+django-environ
+
