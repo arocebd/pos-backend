@@ -1,0 +1,16 @@
+[Unit]
+Description=Gunicorn daemon for POS backend
+After=network.target
+
+[Service]
+User=root
+Group=www-data
+WorkingDirectory=/srv/pos-backend
+Environment="PATH=/srv/pos-backend/venv/bin"
+ExecStart=/srv/pos-backend/venv/bin/gunicorn \
+  --workers 3 \
+  --bind unix:/run/gunicorn-pos.sock \
+  pos.wsgi:application
+
+[Install]
+WantedBy=multi-user.target

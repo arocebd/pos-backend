@@ -36,6 +36,7 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'app.Middleware.SubscriptionMiddleware',
 ]
 
 ROOT_URLCONF = 'pos.urls'
@@ -132,4 +133,11 @@ CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
 ]
+
+AUTHENTICATION_BACKENDS = [
+    "django.contrib.auth.backends.ModelBackend",
+    "app.backends.ShopAwareAuthenticationBackend",
+]
+
 CORS_ALLOW_ALL_ORIGINS = True
+
