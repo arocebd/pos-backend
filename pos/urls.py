@@ -7,7 +7,7 @@ from django.conf.urls.static import static
 
 
 urlpatterns = [
-    path('admin/', admin.site.urls),
+    path('admin-mnlz/', admin.site.urls),  # Hidden admin URL
     path('api/', include('app.urls')),
 ]
 

@@ -4,9 +4,9 @@ from urllib import request
 from django.contrib import admin
 from rest_framework.utils import timezone
 from .models import (
-    Product, Category, Sale, Customer, Expense, Supplier,
+    Product, ProductVariant, Category, Sale, Customer, Expense, Supplier,
     Purchase, Shop, UserProfile, PaymentRequest, SaleItem,
-    PurchaseItem, SupplierPayment
+    PurchaseItem, SupplierPayment, StockLedger, CustomerPayment
 )
 
 
@@ -158,13 +158,16 @@ class CategoryAdmin(ShopOwnedAdmin):
 # -------------------------------
 @admin.register(Product)
 class ProductAdmin(ShopOwnedAdmin):
-    list_display = ("title", "product_code", "category", "regular_price", "selling_price", "stock", "shop")
-    list_filter = ("category", "shop", "created_at")
+    list_display = ("title", "product_code", "category", "base_unit", "has_variants", "regular_price", "selling_price", "stock", "shop")
+    list_filter = ("category", "shop", "base_unit", "has_variants", "created_at")
     search_fields = ("title", "product_code", "sku", "barcode")
     readonly_fields = ("created_at", "updated_at")
     fieldsets = (
         ("Basic Info", {
             'fields': ('title', 'product_code', 'sku', 'barcode', 'category', 'shop')
+        }),
+        ("Inventory Settings", {
+            'fields': ('base_unit', 'has_variants')
         }),
         ("Pricing", {
             'fields': ('purchased_price', 'regular_price', 'discount', 'selling_price')
@@ -179,8 +182,18 @@ class ProductAdmin(ShopOwnedAdmin):
     )
 
 
+# -------------------------------# PRODUCT VARIANT
 # -------------------------------
-# SALE
+@admin.register(ProductVariant)
+class ProductVariantAdmin(admin.ModelAdmin):
+    list_display = ("product", "variant_name", "sku", "barcode", "purchase_price", "selling_price", "stock")
+    list_filter = ("product__shop", "created_at")
+    search_fields = ("variant_name", "sku", "barcode", "product__title")
+    readonly_fields = ("created_at", "updated_at")
+    autocomplete_fields = ["product"]
+
+
+# -------------------------------# SALE
 # -------------------------------
 @admin.register(Sale)
 class SaleAdmin(ShopOwnedAdmin):
@@ -281,10 +294,10 @@ class PurchaseAdmin(ShopOwnedAdmin):
 # -------------------------------
 @admin.register(PurchaseItem)
 class PurchaseItemAdmin(ShopOwnedAdmin):
-    list_display = ("purchase", "product", "quantity", "purchase_price", "total")
-    list_filter = ("purchase__shop", "purchase__date")
-    search_fields = ("product__title", "purchase__invoice_no")
-    readonly_fields = ("total",)
+    list_display = ("purchase", "product", "product_variant", "pack_unit", "qty_packs", "price_per_pack", "total_base_qty", "total")
+    list_filter = ("purchase__shop", "purchase__date", "pack_unit")
+    search_fields = ("product__title", "product_variant__variant_name", "purchase__invoice_no", "batch_no")
+    readonly_fields = ("total", "total_base_qty", "cost_per_base_unit")
 
 
 # -------------------------------
@@ -296,3 +309,30 @@ class SupplierPaymentAdmin(ShopOwnedAdmin):
     list_filter = ("date", "supplier", "shop", "payment_method")
     search_fields = ("supplier__name", "memo_no", "remarks")
     readonly_fields = ("date",)
+
+
+# -------------------------------
+# CUSTOMER PAYMENT
+# -------------------------------
+@admin.register(CustomerPayment)
+class CustomerPaymentAdmin(ShopOwnedAdmin):
+    list_display = ("customer", "date", "amount", "payment_method", "shop", "memo_no")
+    list_filter = ("date", "customer", "shop", "payment_method")
+    search_fields = ("customer__name", "memo_no", "remarks")
+    readonly_fields = ("date",)
+
+
+# -------------------------------
+# STOCK LEDGER
+# -------------------------------
+@admin.register(StockLedger)
+class StockLedgerAdmin(ShopOwnedAdmin):
+    list_display = ("transaction_date", "transaction_type", "product", "product_variant", "batch_no", "expiry_date", "quantity", "remaining_qty", "shop")
+    list_filter = ("transaction_type", "shop", "expiry_date", "transaction_date")
+    search_fields = ("batch_no", "product__title", "product_variant__variant_name")
+    readonly_fields = ("transaction_date",)
+    date_hierarchy = "transaction_date"
+    
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        return qs.select_related("product", "product_variant", "shop")

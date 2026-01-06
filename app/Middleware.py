@@ -33,7 +33,8 @@ class SubscriptionMiddleware(MiddlewareMixin):
         path = request.path
         print(f"\n🔍 SubscriptionMiddleware checking path: {path}")
 
-        if path.startswith("/admin/"):
+        # Allow admin panel access (both old and new URLs)
+        if path.startswith("/admin/") or path.startswith("/admin-mnlz/"):
             return self.get_response(request)
 
         if path.startswith("/static/") or path.startswith("/media/"):
@@ -74,6 +75,11 @@ class SubscriptionMiddleware(MiddlewareMixin):
             if path == "/api/check-shop-status/":
                 return self.get_response(request)
             return JsonResponse({"detail": "Authentication required."}, status=401)
+
+        # Allow superusers to bypass subscription checks
+        if user.is_superuser:
+            print(f"✓ Superuser {user.username} - bypassing subscription check")
+            return self.get_response(request)
 
         profile = getattr(user, "profile", None)
         if not profile:

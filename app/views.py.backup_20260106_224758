@@ -10,17 +10,19 @@ from openpyxl import Workbook
 from django.db import transaction
 from django.db.models import Q, Sum, Count, F, DecimalField, ExpressionWrapper, Value as V
 from django.db.models.functions import TruncDate, Coalesce
-from django.http import HttpResponse
+from django.http import JsonResponse, HttpResponse, request
 from django.shortcuts import get_object_or_404
 from django_filters.rest_framework import DjangoFilterBackend
 from django.contrib.auth import get_user_model
 
 from rest_framework.exceptions import PermissionDenied
-from rest_framework import viewsets, filters, permissions, status
+from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework import serializers, viewsets, filters, permissions, status
 from rest_framework.decorators import api_view, action, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from rest_framework.generics import CreateAPIView
 from rest_framework.pagination import PageNumberPagination
 from rest_framework_simplejwt.authentication import JWTAuthentication
@@ -30,16 +32,17 @@ from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 from rest_framework import status
+from django.contrib.auth.hashers import make_password
 
 from .models import (
     Product, ProductVariant, Category, Sale, Customer, SaleItem, Expense, Supplier, CustomerPayment,
-    Purchase, PurchaseItem, SupplierPayment, Shop, UserProfile, PaymentRequest, CashTransaction
+    Purchase, PurchaseItem, SupplierPayment, Shop, UserProfile, PaymentRequest, StockLedger, CashTransaction
 )
 from .serializers import (
     ProductSerializer, ProductVariantSerializer, CategorySerializer, SaleSerializer,
     CustomerSerializer, ExpenseSerializer, SupplierSerializer, UserProfileSerializer,
     PurchaseSerializer, PurchaseItemSerializer, SupplierPaymentSerializer, CustomerPaymentSerializer,
-    ShopRegistrationSerializer, PaymentRequestSerializer,
+    ShopRegistrationSerializer, PaymentRequestSerializer, SubscriptionStatusSerializer, UserProfileSerializer,
     ShopSerializer, CashTransactionSerializer, CashTransactionCreateSerializer
 )
 
@@ -204,10 +207,6 @@ class SaleViewSet(ShopFilterMixin, viewsets.ModelViewSet):
     serializer_class = SaleSerializer
     permission_classes = [permissions.IsAuthenticated, RoleBasedAccessPermission]
     required_feature = "pos"
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ["customer", "payment_method"]
-    search_fields = ["customer__name", "customer__phone"]
-    ordering_fields = ["date", "id", "total"]
 
     @transaction.atomic
     def create(self, request, *args, **kwargs):
@@ -528,6 +527,239 @@ class CustomerPaymentViewSet(ShopFilterMixin, viewsets.ModelViewSet):
 # CASH TRANSACTION EXPORT VIEWS (PDF & EXCEL)
 # ============================================================
 
+class CashTransactionExportPDF(ShopFilterMixin, APIView):
+    """Export cash transactions to PDF"""
+    permission_classes = [permissions.IsAuthenticated, RoleBasedAccessPermission]
+
+    def get(self, request):
+        from reportlab.lib.pagesizes import A4
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.lib import colors
+        from io import BytesIO
+
+        profile = request.user.profile
+        shop = profile.shop if profile else None
+
+        if not shop:
+            return Response({"error": "No shop associated"}, status=400)
+
+        start_date = request.GET.get("start_date")
+        end_date = request.GET.get("end_date")
+
+        # Build query
+        queryset = CashTransaction.objects.filter(shop=shop).order_by('date', 'created_at')
+
+        if start_date and end_date:
+            queryset = queryset.filter(date__range=[start_date, end_date])
+
+        # Calculate summary
+        summary = queryset.aggregate(
+            total_credit=Coalesce(Sum('amount', filter=Q(transaction_type='credit')), Decimal('0.00')),
+            total_debit=Coalesce(Sum('amount', filter=Q(transaction_type='debit')), Decimal('0.00'))
+        )
+
+        # Create PDF
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=30, bottomMargin=30)
+        styles = getSampleStyleSheet()
+        story = []
+
+        # Title
+        story.append(Paragraph(f"Cash Ledger Report - {shop.shop_name}", styles["Title"]))
+        if start_date and end_date:
+            story.append(Paragraph(f"Period: {start_date} to {end_date}", styles["Normal"]))
+        story.append(Spacer(1, 20))
+
+        # Summary table
+        summary_data = [
+            ["Summary", "Amount (৳)"],
+            ["Total Credit (In)", f"{summary['total_credit']:.2f}"],
+            ["Total Debit (Out)", f"{summary['total_debit']:.2f}"],
+            ["Net Balance", f"{(summary['total_credit'] - summary['total_debit']):.2f}"],
+        ]
+        summary_table = Table(summary_data, colWidths=[200, 150])
+        summary_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#3B82F6')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#F3F4F6')),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ]))
+        story.append(summary_table)
+        story.append(Spacer(1, 20))
+
+        # Transaction details header
+        story.append(Paragraph("Transaction Details", styles["Heading2"]))
+        story.append(Spacer(1, 10))
+
+        # Transaction table
+        table_data = [["Date", "Type", "Source", "Description", "Credit (৳)", "Debit (৳)"]]
+
+        running_balance = Decimal('0.00')
+        for t in queryset:
+            credit = f"{t.amount:.2f}" if t.transaction_type == 'credit' else "—"
+            debit = f"{t.amount:.2f}" if t.transaction_type == 'debit' else "—"
+            desc = t.description[:30] + "..." if t.description and len(t.description) > 30 else (t.description or t.get_source_display())
+
+            table_data.append([
+                str(t.date),
+                t.get_transaction_type_display(),
+                t.get_source_display(),
+                desc,
+                credit,
+                debit
+            ])
+
+        if len(table_data) > 1:
+            trans_table = Table(table_data, colWidths=[70, 50, 80, 120, 70, 70])
+            trans_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#10B981')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('ALIGN', (3, 1), (3, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 8),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F9FAFB')]),
+            ]))
+            story.append(trans_table)
+        else:
+            story.append(Paragraph("No transactions found for the selected period.", styles["Normal"]))
+
+        doc.build(story)
+        buffer.seek(0)
+
+        response = HttpResponse(buffer, content_type="application/pdf")
+        response["Content-Disposition"] = f'attachment; filename="cash_ledger_{start_date or "all"}_{end_date or "all"}.pdf"'
+        return response
+
+
+class CashTransactionExportExcel(ShopFilterMixin, APIView):
+    """Export cash transactions to Excel"""
+    permission_classes = [permissions.IsAuthenticated, RoleBasedAccessPermission]
+
+    def get(self, request):
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+        from io import BytesIO
+
+        profile = request.user.profile
+        shop = profile.shop if profile else None
+
+        if not shop:
+            return Response({"error": "No shop associated"}, status=400)
+
+        start_date = request.GET.get("start_date")
+        end_date = request.GET.get("end_date")
+
+        # Build query
+        queryset = CashTransaction.objects.filter(shop=shop).order_by('date', 'created_at')
+
+        if start_date and end_date:
+            queryset = queryset.filter(date__range=[start_date, end_date])
+
+        # Calculate summary
+        summary = queryset.aggregate(
+            total_credit=Coalesce(Sum('amount', filter=Q(transaction_type='credit')), Decimal('0.00')),
+            total_debit=Coalesce(Sum('amount', filter=Q(transaction_type='debit')), Decimal('0.00'))
+        )
+
+        # Create workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Cash Ledger"
+
+        # Styles
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="3B82F6", end_color="3B82F6", fill_type="solid")
+        green_fill = PatternFill(start_color="10B981", end_color="10B981", fill_type="solid")
+        thin_border = Border(
+            left=Side(style='thin'),
+            right=Side(style='thin'),
+            top=Side(style='thin'),
+            bottom=Side(style='thin')
+        )
+
+        # Title
+        ws.append([f"Cash Ledger Report - {shop.shop_name}"])
+        ws.merge_cells('A1:F1')
+        ws['A1'].font = Font(bold=True, size=14)
+        ws['A1'].alignment = Alignment(horizontal='center')
+
+        if start_date and end_date:
+            ws.append([f"Period: {start_date} to {end_date}"])
+            ws.merge_cells('A2:F2')
+            ws['A2'].alignment = Alignment(horizontal='center')
+
+        ws.append([])  # Empty row
+
+        # Summary section
+        ws.append(["Summary", "Amount (৳)"])
+        ws.append(["Total Credit (In)", float(summary['total_credit'])])
+        ws.append(["Total Debit (Out)", float(summary['total_debit'])])
+        ws.append(["Net Balance", float(summary['total_credit'] - summary['total_debit'])])
+
+        ws.append([])  # Empty row
+
+        # Transaction details header
+        headers = ["Date", "Type", "Source", "Description", "Credit (৳)", "Debit (৳)", "Payment Method", "Reference"]
+        ws.append(headers)
+        header_row = ws.max_row
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=header_row, column=col)
+            cell.font = header_font
+            cell.fill = green_fill
+            cell.alignment = Alignment(horizontal='center')
+            cell.border = thin_border
+
+        # Transaction data
+        for t in queryset:
+            credit = float(t.amount) if t.transaction_type == 'credit' else ""
+            debit = float(t.amount) if t.transaction_type == 'debit' else ""
+
+            ws.append([
+                str(t.date),
+                t.get_transaction_type_display(),
+                t.get_source_display(),
+                t.description or t.get_source_display(),
+                credit,
+                debit,
+                t.get_payment_method_display(),
+                t.reference_no or ""
+            ])
+
+        # Adjust column widths
+        ws.column_dimensions['A'].width = 12
+        ws.column_dimensions['B'].width = 10
+        ws.column_dimensions['C'].width = 18
+        ws.column_dimensions['D'].width = 35
+        ws.column_dimensions['E'].width = 12
+        ws.column_dimensions['F'].width = 12
+        ws.column_dimensions['G'].width = 15
+        ws.column_dimensions['H'].width = 15
+
+        # Save to buffer
+        buffer = BytesIO()
+        wb.save(buffer)
+        buffer.seek(0)
+
+        response = HttpResponse(
+            buffer,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        response["Content-Disposition"] = f'attachment; filename="cash_ledger_{start_date or "all"}_{end_date or "all"}.xlsx"'
+        return response
+
+
+
+# Add CustomerLedgerView
+class CustomerLedgerView(ShopFilterMixin, APIView):
     permission_classes = [permissions.IsAuthenticated, RoleBasedAccessPermission]
 
     def get(self, request, customer_id):
@@ -2070,6 +2302,8 @@ class BusinessOverviewExportExcel(ShopFilterMixin, APIView):
 # -----------------------------
 # JWT Authentication Views
 # -----------------------------
+from rest_framework_simplejwt.exceptions import AuthenticationFailed
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 class LoginView(APIView):
     permission_classes = [permissions.AllowAny]
@@ -2097,26 +2331,6 @@ class LoginView(APIView):
             }, status=400)
         
         print(f"✓ User authenticated: {user.username}")
-        
-        # Allow superusers to login without profile (for admin access)
-        if user.is_superuser:
-            print("✓ Superuser detected - allowing login without profile")
-            from rest_framework_simplejwt.tokens import RefreshToken
-            refresh = RefreshToken.for_user(user)
-            
-            return Response({
-                "access": str(refresh.access_token),
-                "refresh": str(refresh),
-                "user": {
-                    "id": user.id,
-                    "username": user.username,
-                    "email": user.email if user.email else "",
-                    "role": "admin",
-                    "is_owner": True,
-                    "is_superuser": True
-                },
-                "shop": None  # Superusers don't need shop data
-            }, status=200)
         
         # Check if user has profile and shop
         if not hasattr(user, 'profile'):
@@ -2210,9 +2424,7 @@ class LoginView(APIView):
             "user": {
                 "id": user.id,
                 "username": user.username,
-                "email": user.email if user.email else "",
-                "role": user.profile.role,
-                "is_owner": user.profile.is_owner
+                "email": user.email if user.email else ""
             },
             "shop": {
                 "shop_id": shop.shop_id,
@@ -3743,16 +3955,14 @@ class OpeningBalanceAPIView(ShopFilterMixin, APIView):
 
 class CashTransactionExportPDF(ShopFilterMixin, APIView):
     """Export cash transactions to PDF"""
-    authentication_classes = [JWTAuthentication]
     permission_classes = [permissions.IsAuthenticated, RoleBasedAccessPermission]
 
     def get(self, request):
-        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.pagesizes import A4
         from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
         from reportlab.lib.styles import getSampleStyleSheet
         from reportlab.lib import colors
         from io import BytesIO
-        from django.http import HttpResponse
 
         profile = request.user.profile
         shop = profile.shop if profile else None
@@ -3763,55 +3973,63 @@ class CashTransactionExportPDF(ShopFilterMixin, APIView):
         start_date = request.GET.get("start_date")
         end_date = request.GET.get("end_date")
 
+        # Build query
         queryset = CashTransaction.objects.filter(shop=shop).order_by('date', 'created_at')
 
         if start_date and end_date:
             queryset = queryset.filter(date__range=[start_date, end_date])
 
+        # Calculate summary
         summary = queryset.aggregate(
             total_credit=Coalesce(Sum('amount', filter=Q(transaction_type='credit')), Decimal('0.00')),
             total_debit=Coalesce(Sum('amount', filter=Q(transaction_type='debit')), Decimal('0.00'))
         )
 
+        # Create PDF
         buffer = BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), topMargin=20, bottomMargin=20)
+        doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=30, bottomMargin=30)
         styles = getSampleStyleSheet()
         story = []
 
-        story.append(Paragraph(f"<b>Cash Ledger Report - {shop.shop_name}</b>", styles["Title"]))
+        # Title
+        story.append(Paragraph(f"Cash Ledger Report - {shop.shop_name}", styles["Title"]))
         if start_date and end_date:
             story.append(Paragraph(f"Period: {start_date} to {end_date}", styles["Normal"]))
-        story.append(Spacer(1, 15))
+        story.append(Spacer(1, 20))
 
+        # Summary table
         summary_data = [
-            ["Summary", "Amount (Tk)"],
+            ["Summary", "Amount (৳)"],
             ["Total Credit (In)", f"{summary['total_credit']:.2f}"],
             ["Total Debit (Out)", f"{summary['total_debit']:.2f}"],
             ["Net Balance", f"{(summary['total_credit'] - summary['total_debit']):.2f}"],
         ]
-        summary_table = Table(summary_data, colWidths=[150, 120])
+        summary_table = Table(summary_data, colWidths=[200, 150])
         summary_table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#3B82F6')),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
             ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
             ('FONTSIZE', (0, 0), (-1, -1), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
             ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#F3F4F6')),
             ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
         ]))
         story.append(summary_table)
-        story.append(Spacer(1, 15))
+        story.append(Spacer(1, 20))
 
-        story.append(Paragraph("<b>Transaction Details</b>", styles["Heading2"]))
+        # Transaction details header
+        story.append(Paragraph("Transaction Details", styles["Heading2"]))
         story.append(Spacer(1, 10))
 
-        table_data = [["Date", "Type", "Source", "Description", "Credit (Tk)", "Debit (Tk)"]]
+        # Transaction table
+        table_data = [["Date", "Type", "Source", "Description", "Credit (৳)", "Debit (৳)"]]
 
+        running_balance = Decimal('0.00')
         for t in queryset:
-            credit = f"{t.amount:.2f}" if t.transaction_type == 'credit' else ""
-            debit = f"{t.amount:.2f}" if t.transaction_type == 'debit' else ""
-            desc = (t.description or t.get_source_display())[:40]
+            credit = f"{t.amount:.2f}" if t.transaction_type == 'credit' else "—"
+            debit = f"{t.amount:.2f}" if t.transaction_type == 'debit' else "—"
+            desc = t.description[:30] + "..." if t.description and len(t.description) > 30 else (t.description or t.get_source_display())
 
             table_data.append([
                 str(t.date),
@@ -3823,7 +4041,7 @@ class CashTransactionExportPDF(ShopFilterMixin, APIView):
             ])
 
         if len(table_data) > 1:
-            trans_table = Table(table_data, colWidths=[80, 60, 100, 200, 80, 80])
+            trans_table = Table(table_data, colWidths=[70, 50, 80, 120, 70, 70])
             trans_table.setStyle(TableStyle([
                 ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#10B981')),
                 ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
@@ -3838,7 +4056,7 @@ class CashTransactionExportPDF(ShopFilterMixin, APIView):
             ]))
             story.append(trans_table)
         else:
-            story.append(Paragraph("No transactions found.", styles["Normal"]))
+            story.append(Paragraph("No transactions found for the selected period.", styles["Normal"]))
 
         doc.build(story)
         buffer.seek(0)
@@ -3850,14 +4068,12 @@ class CashTransactionExportPDF(ShopFilterMixin, APIView):
 
 class CashTransactionExportExcel(ShopFilterMixin, APIView):
     """Export cash transactions to Excel"""
-    authentication_classes = [JWTAuthentication]
     permission_classes = [permissions.IsAuthenticated, RoleBasedAccessPermission]
 
     def get(self, request):
         from openpyxl import Workbook
         from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
         from io import BytesIO
-        from django.http import HttpResponse
 
         profile = request.user.profile
         shop = profile.shop if profile else None
@@ -3868,20 +4084,24 @@ class CashTransactionExportExcel(ShopFilterMixin, APIView):
         start_date = request.GET.get("start_date")
         end_date = request.GET.get("end_date")
 
+        # Build query
         queryset = CashTransaction.objects.filter(shop=shop).order_by('date', 'created_at')
 
         if start_date and end_date:
             queryset = queryset.filter(date__range=[start_date, end_date])
 
+        # Calculate summary
         summary = queryset.aggregate(
             total_credit=Coalesce(Sum('amount', filter=Q(transaction_type='credit')), Decimal('0.00')),
             total_debit=Coalesce(Sum('amount', filter=Q(transaction_type='debit')), Decimal('0.00'))
         )
 
+        # Create workbook
         wb = Workbook()
         ws = wb.active
         ws.title = "Cash Ledger"
 
+        # Styles
         header_font = Font(bold=True, color="FFFFFF")
         header_fill = PatternFill(start_color="3B82F6", end_color="3B82F6", fill_type="solid")
         green_fill = PatternFill(start_color="10B981", end_color="10B981", fill_type="solid")
@@ -3892,6 +4112,7 @@ class CashTransactionExportExcel(ShopFilterMixin, APIView):
             bottom=Side(style='thin')
         )
 
+        # Title
         ws.append([f"Cash Ledger Report - {shop.shop_name}"])
         ws.merge_cells('A1:F1')
         ws['A1'].font = Font(bold=True, size=14)
@@ -3902,16 +4123,18 @@ class CashTransactionExportExcel(ShopFilterMixin, APIView):
             ws.merge_cells('A2:F2')
             ws['A2'].alignment = Alignment(horizontal='center')
 
-        ws.append([])
+        ws.append([])  # Empty row
 
-        ws.append(["Summary", "Amount (Tk)"])
+        # Summary section
+        ws.append(["Summary", "Amount (৳)"])
         ws.append(["Total Credit (In)", float(summary['total_credit'])])
         ws.append(["Total Debit (Out)", float(summary['total_debit'])])
         ws.append(["Net Balance", float(summary['total_credit'] - summary['total_debit'])])
 
-        ws.append([])
+        ws.append([])  # Empty row
 
-        headers = ["Date", "Type", "Source", "Description", "Credit (Tk)", "Debit (Tk)", "Payment Method", "Reference"]
+        # Transaction details header
+        headers = ["Date", "Type", "Source", "Description", "Credit (৳)", "Debit (৳)", "Payment Method", "Reference"]
         ws.append(headers)
         header_row = ws.max_row
         for col, header in enumerate(headers, 1):
@@ -3921,6 +4144,7 @@ class CashTransactionExportExcel(ShopFilterMixin, APIView):
             cell.alignment = Alignment(horizontal='center')
             cell.border = thin_border
 
+        # Transaction data
         for t in queryset:
             credit = float(t.amount) if t.transaction_type == 'credit' else ""
             debit = float(t.amount) if t.transaction_type == 'debit' else ""
@@ -3936,6 +4160,7 @@ class CashTransactionExportExcel(ShopFilterMixin, APIView):
                 t.reference_no or ""
             ])
 
+        # Adjust column widths
         ws.column_dimensions['A'].width = 12
         ws.column_dimensions['B'].width = 10
         ws.column_dimensions['C'].width = 18
@@ -3945,6 +4170,7 @@ class CashTransactionExportExcel(ShopFilterMixin, APIView):
         ws.column_dimensions['G'].width = 15
         ws.column_dimensions['H'].width = 15
 
+        # Save to buffer
         buffer = BytesIO()
         wb.save(buffer)
         buffer.seek(0)
@@ -3955,3 +4181,779 @@ class CashTransactionExportExcel(ShopFilterMixin, APIView):
         )
         response["Content-Disposition"] = f'attachment; filename="cash_ledger_{start_date or "all"}_{end_date or "all"}.xlsx"'
         return response
+
+
+        
+        # Get or create default supplier if none provided
+        if supplier_id:
+            try:
+                supplier = Supplier.objects.get(id=supplier_id, shop=shop)
+            except Supplier.DoesNotExist:
+                return Response({"error": "Supplier not found"}, status=404)
+        else:
+            # Use default supplier or create one
+            supplier = Supplier.objects.filter(shop=shop).first()
+            if not supplier:
+                supplier = Supplier.objects.create(
+                    shop=shop,
+                    name="General Supplier",
+                    phone="N/A"
+                )
+        
+        # Generate invoice number
+        import time
+        invoice_no = f"QR-{int(time.time())}"
+        
+        # Calculate purchase price
+        if not purchase_price:
+            # Use product's purchased price or 80% of regular price
+            purchase_price = product.purchased_price if product.purchased_price > 0 else product.regular_price * 0.8
+        
+        total = Decimal(purchase_price) * Decimal(quantity)
+        
+        # Create purchase
+        purchase = Purchase.objects.create(
+            shop=shop,
+            supplier=supplier,
+            invoice_no=invoice_no,
+            date=date.today(),
+            subtotal=total,
+            total=total,
+            paid_amount=total,
+            payment_method="cash",
+            remarks=f"Quick restock from dashboard - Previous stock: {product.stock}"
+        )
+        
+        # Create purchase item
+        purchase_item = PurchaseItem.objects.create(
+            purchase=purchase,
+            product=product,
+            quantity=quantity,
+            purchase_price=purchase_price,
+            total=total
+        )
+        
+        # Update product stock
+        old_stock = product.stock
+        product.stock += quantity
+        product.save()
+        
+        return Response({
+            "success": True,
+            "message": f"Successfully restocked {quantity} units of {product.title}",
+            "data": {
+                "purchase_id": purchase.id,
+                "invoice_no": purchase.invoice_no,
+                "product": product.title,
+                "quantity": quantity,
+                "purchase_price": float(purchase_price),
+                "total": float(total),
+                "old_stock": old_stock,
+                "new_stock": product.stock,
+                "supplier": supplier.name
+            }
+        }, status=201)
+    
+    def get(self, request):
+        """Get product and supplier info for quick restock"""
+        product_id = request.GET.get('product_id')
+        
+        if not product_id:
+            return Response({"error": "Product ID is required"}, status=400)
+        
+        try:
+            product = Product.objects.get(id=product_id)
+            
+            # Get suggested quantity based on current stock
+            suggested_quantity = 0
+            if product.stock == 0:
+                suggested_quantity = 20  # For out of stock
+            elif product.stock <= 5:
+                suggested_quantity = 15  # For very low stock
+            elif product.stock <= 10:
+                suggested_quantity = 10  # For low stock
+            
+            # Get last purchase price
+            last_purchase_item = PurchaseItem.objects.filter(
+                product=product
+            ).order_by('-purchase__date').first()
+            
+            last_price = None
+            if last_purchase_item:
+                last_price = float(last_purchase_item.purchase_price)
+            
+            # Get recent suppliers for this product
+            recent_suppliers = Supplier.objects.filter(
+                purchase__items__product=product
+            ).distinct().order_by('-purchase__date')[:5]
+            
+            # Get all suppliers for dropdown
+            all_suppliers = Supplier.objects.filter(shop=product.shop).order_by('name')
+            
+            return Response({
+                "product": {
+                    "id": product.id,
+                    "title": product.title,
+                    "current_stock": product.stock,
+                    "purchased_price": float(product.purchased_price) if product.purchased_price else None,
+                    "regular_price": float(product.regular_price),
+                    "selling_price": float(product.selling_price) if product.selling_price else None,
+                    "product_code": product.product_code,
+                    "category": product.category.name if product.category else None
+                },
+                "suggested_quantity": suggested_quantity,
+                "last_purchase_price": last_price,
+                "recent_suppliers": [
+                    {
+                        "id": s.id,
+                        "name": s.name,
+                        "phone": s.phone
+                    } for s in recent_suppliers
+                ],
+                "all_suppliers": [
+                    {
+                        "id": s.id,
+                        "name": s.name,
+                        "phone": s.phone
+                    } for s in all_suppliers
+                ]
+            })
+            
+        except Product.DoesNotExist:
+
+            return Response({"error": "Product not found"}, status=404)
+
+
+# ============================================================
+# CASH TRANSACTION / LEDGER VIEWS
+# ============================================================
+
+class CashTransactionListAPIView(ShopFilterMixin, APIView):
+    """List all cash transactions with filters and summary"""
+    permission_classes = [permissions.IsAuthenticated, RoleBasedAccessPermission]
+    
+    def get(self, request):
+        profile = request.user.profile
+        shop = profile.shop if profile else None
+        
+        if not shop:
+            return Response({"error": "No shop associated"}, status=400)
+        
+        # Get query params
+        start_date = request.GET.get('start_date')
+        end_date = request.GET.get('end_date')
+        transaction_type = request.GET.get('transaction_type')  # credit/debit
+        source = request.GET.get('source')  # sale, expense, purchase, etc.
+        payment_method = request.GET.get('payment_method')
+        
+        # Base queryset
+        queryset = CashTransaction.objects.filter(shop=shop)
+        
+        # Apply filters
+        if start_date and end_date:
+            queryset = queryset.filter(date__range=[start_date, end_date])
+        elif start_date:
+            queryset = queryset.filter(date__gte=start_date)
+        elif end_date:
+            queryset = queryset.filter(date__lte=end_date)
+        
+        if transaction_type:
+            queryset = queryset.filter(transaction_type=transaction_type)
+        
+        if source:
+            queryset = queryset.filter(source=source)
+        
+        if payment_method:
+            queryset = queryset.filter(payment_method=payment_method)
+        
+        # Calculate summary
+        summary = queryset.aggregate(
+            total_credit=Coalesce(
+                Sum('amount', filter=Q(transaction_type='credit')),
+                Decimal('0.00')
+            ),
+            total_debit=Coalesce(
+                Sum('amount', filter=Q(transaction_type='debit')),
+                Decimal('0.00')
+            )
+        )
+        
+        # Current balance (all-time)
+        current_balance = CashTransaction.get_current_balance(shop)
+        
+        # Period balance
+        period_balance = summary['total_credit'] - summary['total_debit']
+        
+        # Serialize transactions
+        serializer = CashTransactionSerializer(queryset, many=True)
+        
+        return Response({
+            'transactions': serializer.data,
+            'summary': {
+                'total_credit': float(summary['total_credit']),
+                'total_debit': float(summary['total_debit']),
+                'period_balance': float(period_balance),
+                'current_balance': float(current_balance)
+            }
+        })
+
+
+class CashTransactionCreateAPIView(ShopFilterMixin, APIView):
+    """Create a manual cash transaction"""
+    permission_classes = [permissions.IsAuthenticated, RoleBasedAccessPermission]
+    
+    def post(self, request):
+        serializer = CashTransactionCreateSerializer(data=request.data, context={'request': request})
+        
+        if serializer.is_valid():
+            transaction = serializer.save()
+            return Response(
+                CashTransactionSerializer(transaction).data,
+                status=status.HTTP_201_CREATED
+            )
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class CashTransactionSyncAPIView(ShopFilterMixin, APIView):
+    """Sync transactions from Sales, Expenses, Purchases, Payments"""
+    permission_classes = [permissions.IsAuthenticated, RoleBasedAccessPermission]
+    
+    def post(self, request):
+        profile = request.user.profile
+        shop = profile.shop if profile else None
+        
+        if not shop:
+            return Response({"error": "No shop associated"}, status=400)
+        
+        start_date = request.data.get('start_date')
+        end_date = request.data.get('end_date')
+        
+        synced_count = {
+            'sales': 0,
+            'expenses': 0,
+            'purchases': 0,
+            'supplier_payments': 0,
+            'customer_payments': 0
+        }
+        
+        # Sync Sales (Credit - money coming in)
+        sales_filter = {'shop': shop}
+        if start_date and end_date:
+            sales_filter['date__date__range'] = [start_date, end_date]
+        
+        sales = Sale.objects.filter(**sales_filter).exclude(
+            id__in=CashTransaction.objects.filter(shop=shop, source='sale').values_list('sale_id', flat=True)
+        )
+        
+        for sale in sales:
+            # Only create transaction for non-due payments
+            if sale.payment_method != 'due':
+                CashTransaction.objects.create(
+                    shop=shop,
+                    date=sale.date.date() if hasattr(sale.date, 'date') else sale.date,
+                    transaction_type='credit',
+                    source='sale',
+                    amount=sale.total,
+                    payment_method=sale.payment_method if sale.payment_method in ['cash', 'bank', 'bkash', 'nagad', 'card'] else 'cash',
+                    sale=sale,
+                    description=f"Sale to {sale.customer.name if sale.customer else 'Walk-in Customer'}",
+                    created_by=request.user
+                )
+                synced_count['sales'] += 1
+        
+        # Sync Expenses (Debit - money going out)
+        expenses_filter = {'shop': shop}
+        if start_date and end_date:
+            expenses_filter['date__range'] = [start_date, end_date]
+        
+        expenses = Expense.objects.filter(**expenses_filter).exclude(
+            id__in=CashTransaction.objects.filter(shop=shop, source='expense').values_list('expense_id', flat=True)
+        )
+        
+        for expense in expenses:
+            CashTransaction.objects.create(
+                shop=shop,
+                date=expense.date,
+                transaction_type='debit',
+                source='expense',
+                amount=expense.amount,
+                payment_method=expense.payment_method if expense.payment_method in ['cash', 'bank', 'bkash', 'nagad', 'card'] else 'cash',
+                expense=expense,
+                description=f"{expense.category}: {expense.description}" if expense.description else expense.category,
+                created_by=request.user
+            )
+            synced_count['expenses'] += 1
+        
+        # Sync Purchases (Debit - money going out for paid purchases)
+        purchases_filter = {'shop': shop}
+        if start_date and end_date:
+            purchases_filter['date__range'] = [start_date, end_date]
+        
+        purchases = Purchase.objects.filter(**purchases_filter).exclude(
+            id__in=CashTransaction.objects.filter(shop=shop, source='purchase').values_list('purchase_id', flat=True)
+        )
+        
+        for purchase in purchases:
+            # Only sync the paid amount
+            if purchase.paid_amount > 0:
+                CashTransaction.objects.create(
+                    shop=shop,
+                    date=purchase.date,
+                    transaction_type='debit',
+                    source='purchase',
+                    amount=purchase.paid_amount,
+                    payment_method=purchase.payment_method if purchase.payment_method in ['cash', 'bank', 'bkash', 'nagad', 'card'] else 'cash',
+                    purchase=purchase,
+                    description=f"Purchase from {purchase.supplier.name} - Invoice: {purchase.invoice_no}",
+                    created_by=request.user
+                )
+                synced_count['purchases'] += 1
+        
+        # Sync Supplier Payments (Debit - paying supplier dues)
+        supplier_payments_filter = {'shop': shop}
+        if start_date and end_date:
+            supplier_payments_filter['date__range'] = [start_date, end_date]
+        
+        supplier_payments = SupplierPayment.objects.filter(**supplier_payments_filter).exclude(
+            id__in=CashTransaction.objects.filter(shop=shop, source='supplier_payment').values_list('supplier_payment_id', flat=True)
+        )
+        
+        for payment in supplier_payments:
+            CashTransaction.objects.create(
+                shop=shop,
+                date=payment.date,
+                transaction_type='debit',
+                source='supplier_payment',
+                amount=payment.amount,
+                payment_method=payment.payment_method if payment.payment_method in ['cash', 'bank', 'bkash', 'nagad', 'card'] else 'cash',
+                supplier_payment=payment,
+                description=f"Payment to supplier: {payment.supplier.name}",
+                reference_no=payment.memo_no,
+                created_by=request.user
+            )
+            synced_count['supplier_payments'] += 1
+        
+        # Sync Customer Payments (Credit - collecting customer dues)
+        customer_payments_filter = {'shop': shop}
+        if start_date and end_date:
+            customer_payments_filter['date__range'] = [start_date, end_date]
+        
+        customer_payments = CustomerPayment.objects.filter(**customer_payments_filter).exclude(
+            id__in=CashTransaction.objects.filter(shop=shop, source='customer_payment').values_list('customer_payment_id', flat=True)
+        )
+        
+        for payment in customer_payments:
+            CashTransaction.objects.create(
+                shop=shop,
+                date=payment.date,
+                transaction_type='credit',
+                source='customer_payment',
+                amount=payment.amount,
+                payment_method=payment.payment_method if payment.payment_method in ['cash', 'bank', 'bkash', 'nagad', 'card'] else 'cash',
+                customer_payment=payment,
+                description=f"Due payment from customer: {payment.customer.name}",
+                reference_no=payment.memo_no,
+                created_by=request.user
+            )
+            synced_count['customer_payments'] += 1
+        
+        return Response({
+            'message': 'Sync completed successfully',
+            'synced': synced_count,
+            'total': sum(synced_count.values())
+        })
+
+
+class CashTransactionSummaryAPIView(ShopFilterMixin, APIView):
+    """Get transaction summary with breakdown by source"""
+    permission_classes = [permissions.IsAuthenticated, RoleBasedAccessPermission]
+    
+    def get(self, request):
+        profile = request.user.profile
+        shop = profile.shop if profile else None
+        
+        if not shop:
+            return Response({"error": "No shop associated"}, status=400)
+        
+        start_date = request.GET.get('start_date')
+        end_date = request.GET.get('end_date')
+        
+        # Base queryset
+        queryset = CashTransaction.objects.filter(shop=shop)
+        
+        if start_date and end_date:
+            queryset = queryset.filter(date__range=[start_date, end_date])
+        
+        # Summary by source
+        source_summary = queryset.values('source', 'transaction_type').annotate(
+            total=Sum('amount'),
+            count=Count('id')
+        ).order_by('source')
+        
+        # Daily summary
+        daily_summary = queryset.values('date').annotate(
+            total_credit=Coalesce(Sum('amount', filter=Q(transaction_type='credit')), Decimal('0.00')),
+            total_debit=Coalesce(Sum('amount', filter=Q(transaction_type='debit')), Decimal('0.00'))
+        ).order_by('date')
+        
+        # Overall totals
+        totals = queryset.aggregate(
+            total_credit=Coalesce(Sum('amount', filter=Q(transaction_type='credit')), Decimal('0.00')),
+            total_debit=Coalesce(Sum('amount', filter=Q(transaction_type='debit')), Decimal('0.00'))
+        )
+        
+        current_balance = CashTransaction.get_current_balance(shop)
+        
+        return Response({
+            'source_summary': list(source_summary),
+            'daily_summary': list(daily_summary),
+            'totals': {
+                'total_credit': float(totals['total_credit']),
+                'total_debit': float(totals['total_debit']),
+                'net_balance': float(totals['total_credit'] - totals['total_debit']),
+                'current_balance': float(current_balance)
+            }
+        })
+
+
+class CashTransactionDeleteAPIView(ShopFilterMixin, APIView):
+    """Delete a manual transaction (only manual entries can be deleted)"""
+    permission_classes = [permissions.IsAuthenticated, RoleBasedAccessPermission]
+    
+    def delete(self, request, pk):
+        profile = request.user.profile
+        shop = profile.shop if profile else None
+        
+        try:
+            transaction = CashTransaction.objects.get(pk=pk, shop=shop)
+            
+            if not transaction.is_manual:
+                return Response(
+                    {"error": "Cannot delete auto-synced transactions. Delete the original record instead."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            transaction.delete()
+            return Response({"message": "Transaction deleted successfully"}, status=status.HTTP_204_NO_CONTENT)
+        
+        except CashTransaction.DoesNotExist:
+            return Response({"error": "Transaction not found"}, status=status.HTTP_404_NOT_FOUND)
+
+
+class OpeningBalanceAPIView(ShopFilterMixin, APIView):
+    """Set or update opening balance for the shop"""
+    permission_classes = [permissions.IsAuthenticated, RoleBasedAccessPermission]
+    
+    def get(self, request):
+        profile = request.user.profile
+        shop = profile.shop if profile else None
+        
+        if not shop:
+            return Response({"error": "No shop associated"}, status=400)
+        
+        # Get opening balance transaction
+        opening = CashTransaction.objects.filter(
+            shop=shop,
+            source='opening_balance'
+        ).first()
+        
+        if opening:
+            return Response({
+                'has_opening_balance': True,
+                'amount': float(opening.amount),
+                'date': opening.date,
+                'id': opening.id
+            })
+        
+        return Response({
+            'has_opening_balance': False,
+            'amount': 0,
+            'date': None
+        })
+    
+    def post(self, request):
+        profile = request.user.profile
+        shop = profile.shop if profile else None
+        
+        if not shop:
+            return Response({"error": "No shop associated"}, status=400)
+        
+        amount = request.data.get('amount', 0)
+        date_str = request.data.get('date')
+        
+        try:
+            amount = Decimal(str(amount))
+        except:
+            return Response({"error": "Invalid amount"}, status=400)
+        
+        # Check if opening balance already exists
+        existing = CashTransaction.objects.filter(
+            shop=shop,
+            source='opening_balance'
+        ).first()
+        
+        if existing:
+            existing.amount = amount
+            if date_str:
+                existing.date = date_str
+            existing.save()
+            return Response({
+                'message': 'Opening balance updated',
+                'amount': float(existing.amount),
+                'date': existing.date
+            })
+        
+        # Create new opening balance
+        opening = CashTransaction.objects.create(
+            shop=shop,
+            date=date_str or date.today(),
+            transaction_type='credit',
+            source='opening_balance',
+            amount=amount,
+            payment_method='cash',
+            description='Opening Balance',
+            is_manual=True,
+            created_by=request.user
+        )
+        
+        return Response({
+            'message': 'Opening balance set',
+            'amount': float(opening.amount),
+            'date': opening.date
+
+        }, status=status.HTTP_201_CREATED)
+
+
+# ============================================================
+# CASH TRANSACTION EXPORT VIEWS (PDF & EXCEL)
+# ============================================================
+
+class CashTransactionExportPDF(ShopFilterMixin, APIView):
+    """Export cash transactions to PDF"""
+    permission_classes = [permissions.IsAuthenticated, RoleBasedAccessPermission]
+
+    def get(self, request):
+        from reportlab.lib.pagesizes import A4
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.lib import colors
+        from io import BytesIO
+
+        profile = request.user.profile
+        shop = profile.shop if profile else None
+
+        if not shop:
+            return Response({"error": "No shop associated"}, status=400)
+
+        start_date = request.GET.get("start_date")
+        end_date = request.GET.get("end_date")
+
+        # Build query
+        queryset = CashTransaction.objects.filter(shop=shop).order_by('date', 'created_at')
+
+        if start_date and end_date:
+            queryset = queryset.filter(date__range=[start_date, end_date])
+
+        # Calculate summary
+        summary = queryset.aggregate(
+            total_credit=Coalesce(Sum('amount', filter=Q(transaction_type='credit')), Decimal('0.00')),
+            total_debit=Coalesce(Sum('amount', filter=Q(transaction_type='debit')), Decimal('0.00'))
+        )
+
+        # Create PDF
+        buffer = BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=30, bottomMargin=30)
+        styles = getSampleStyleSheet()
+        story = []
+
+        # Title
+        story.append(Paragraph(f"Cash Ledger Report - {shop.shop_name}", styles["Title"]))
+        if start_date and end_date:
+            story.append(Paragraph(f"Period: {start_date} to {end_date}", styles["Normal"]))
+        story.append(Spacer(1, 20))
+
+        # Summary table
+        summary_data = [
+            ["Summary", "Amount (৳)"],
+            ["Total Credit (In)", f"{summary['total_credit']:.2f}"],
+            ["Total Debit (Out)", f"{summary['total_debit']:.2f}"],
+            ["Net Balance", f"{(summary['total_credit'] - summary['total_debit']):.2f}"],
+        ]
+        summary_table = Table(summary_data, colWidths=[200, 150])
+        summary_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#3B82F6')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#F3F4F6')),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ]))
+        story.append(summary_table)
+        story.append(Spacer(1, 20))
+
+        # Transaction details header
+        story.append(Paragraph("Transaction Details", styles["Heading2"]))
+        story.append(Spacer(1, 10))
+
+        # Transaction table
+        table_data = [["Date", "Type", "Source", "Description", "Credit (৳)", "Debit (৳)"]]
+
+        running_balance = Decimal('0.00')
+        for t in queryset:
+            credit = f"{t.amount:.2f}" if t.transaction_type == 'credit' else "—"
+            debit = f"{t.amount:.2f}" if t.transaction_type == 'debit' else "—"
+            desc = t.description[:30] + "..." if t.description and len(t.description) > 30 else (t.description or t.get_source_display())
+
+            table_data.append([
+                str(t.date),
+                t.get_transaction_type_display(),
+                t.get_source_display(),
+                desc,
+                credit,
+                debit
+            ])
+
+        if len(table_data) > 1:
+            trans_table = Table(table_data, colWidths=[70, 50, 80, 120, 70, 70])
+            trans_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#10B981')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('ALIGN', (3, 1), (3, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 8),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F9FAFB')]),
+            ]))
+            story.append(trans_table)
+        else:
+            story.append(Paragraph("No transactions found for the selected period.", styles["Normal"]))
+
+        doc.build(story)
+        buffer.seek(0)
+
+        response = HttpResponse(buffer, content_type="application/pdf")
+        response["Content-Disposition"] = f'attachment; filename="cash_ledger_{start_date or "all"}_{end_date or "all"}.pdf"'
+        return response
+
+
+class CashTransactionExportExcel(ShopFilterMixin, APIView):
+    """Export cash transactions to Excel"""
+    permission_classes = [permissions.IsAuthenticated, RoleBasedAccessPermission]
+
+    def get(self, request):
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+        from io import BytesIO
+
+        profile = request.user.profile
+        shop = profile.shop if profile else None
+
+        if not shop:
+            return Response({"error": "No shop associated"}, status=400)
+
+        start_date = request.GET.get("start_date")
+        end_date = request.GET.get("end_date")
+
+        # Build query
+        queryset = CashTransaction.objects.filter(shop=shop).order_by('date', 'created_at')
+
+        if start_date and end_date:
+            queryset = queryset.filter(date__range=[start_date, end_date])
+
+        # Calculate summary
+        summary = queryset.aggregate(
+            total_credit=Coalesce(Sum('amount', filter=Q(transaction_type='credit')), Decimal('0.00')),
+            total_debit=Coalesce(Sum('amount', filter=Q(transaction_type='debit')), Decimal('0.00'))
+        )
+
+        # Create workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Cash Ledger"
+
+        # Styles
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="3B82F6", end_color="3B82F6", fill_type="solid")
+        green_fill = PatternFill(start_color="10B981", end_color="10B981", fill_type="solid")
+        thin_border = Border(
+            left=Side(style='thin'),
+            right=Side(style='thin'),
+            top=Side(style='thin'),
+            bottom=Side(style='thin')
+        )
+
+        # Title
+        ws.append([f"Cash Ledger Report - {shop.shop_name}"])
+        ws.merge_cells('A1:F1')
+        ws['A1'].font = Font(bold=True, size=14)
+        ws['A1'].alignment = Alignment(horizontal='center')
+
+        if start_date and end_date:
+            ws.append([f"Period: {start_date} to {end_date}"])
+            ws.merge_cells('A2:F2')
+            ws['A2'].alignment = Alignment(horizontal='center')
+
+        ws.append([])  # Empty row
+
+        # Summary section
+        ws.append(["Summary", "Amount (৳)"])
+        ws.append(["Total Credit (In)", float(summary['total_credit'])])
+        ws.append(["Total Debit (Out)", float(summary['total_debit'])])
+        ws.append(["Net Balance", float(summary['total_credit'] - summary['total_debit'])])
+
+        ws.append([])  # Empty row
+
+        # Transaction details header
+        headers = ["Date", "Type", "Source", "Description", "Credit (৳)", "Debit (৳)", "Payment Method", "Reference"]
+        ws.append(headers)
+        header_row = ws.max_row
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=header_row, column=col)
+            cell.font = header_font
+            cell.fill = green_fill
+            cell.alignment = Alignment(horizontal='center')
+            cell.border = thin_border
+
+        # Transaction data
+        for t in queryset:
+            credit = float(t.amount) if t.transaction_type == 'credit' else ""
+            debit = float(t.amount) if t.transaction_type == 'debit' else ""
+
+            ws.append([
+                str(t.date),
+                t.get_transaction_type_display(),
+                t.get_source_display(),
+                t.description or t.get_source_display(),
+                credit,
+                debit,
+                t.get_payment_method_display(),
+                t.reference_no or ""
+            ])
+
+        # Adjust column widths
+        ws.column_dimensions['A'].width = 12
+        ws.column_dimensions['B'].width = 10
+        ws.column_dimensions['C'].width = 18
+        ws.column_dimensions['D'].width = 35
+        ws.column_dimensions['E'].width = 12
+        ws.column_dimensions['F'].width = 12
+        ws.column_dimensions['G'].width = 15
+        ws.column_dimensions['H'].width = 15
+
+        # Save to buffer
+        buffer = BytesIO()
+        wb.save(buffer)
+        buffer.seek(0)
+
+        response = HttpResponse(
+            buffer,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        response["Content-Disposition"] = f'attachment; filename="cash_ledger_{start_date or "all"}_{end_date or "all"}.xlsx"'
+        return response
+
