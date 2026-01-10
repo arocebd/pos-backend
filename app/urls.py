@@ -14,7 +14,7 @@ from .views import (
     BusinessOverviewAPIView, BusinessOverviewTimeseriesAPIView,
     BusinessOverviewExportPDF, BusinessOverviewExportExcel,
     LoginView, ShopRegistrationView, SubscriptionStatusView,
-    CreatePaymentRequestView, AdminVerifyPaymentView,
+    CreatePaymentRequestView, AdminVerifyPaymentView, PaymentVerificationStatusView,
     UpdateShopLogoView, UpdateProfilePictureView, CustomerPaymentViewSet,
     CustomerDueSummaryView, CustomerLedgerDetailView,
     ShopUserViewSet, shop_settings, get_current_user_profile, update_user_password,
@@ -85,6 +85,7 @@ urlpatterns = [
     path("subscription-status/", SubscriptionStatusView.as_view(), name="subscription-status"),
     path("renew-subscription/", RenewSubscriptionView.as_view(), name="renew-subscription"),
     path("payment-request/", CreatePaymentRequestView.as_view(), name="payment-request"),
+    path("payment-verification-status/", PaymentVerificationStatusView.as_view(), name="payment-verification-status"),
     
     # Admin verifies payment
     path("admin/verify-payment/<str:shop_id>/", AdminVerifyPaymentView.as_view(), name="verify-payment"),

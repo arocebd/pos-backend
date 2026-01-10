@@ -57,6 +57,20 @@ class Shop(models.Model):
         self.is_active = True
         self.expire_date = date.today() + timedelta(days=365)
         self.save()
+    
+    def save(self, *args, **kwargs):
+        # Compress logo if it exists
+        if self.logo:
+            from .utils import compress_and_resize_image
+            self.logo = compress_and_resize_image(
+                self.logo,
+                target_size=(300, 300),
+                target_format='WEBP',
+                max_size_kb=50,
+                min_size_kb=15,
+                target_size_kb=30
+            )
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.shop_name} ({self.shop_id})"
@@ -179,6 +193,18 @@ class Product(models.Model):
         unique_together = ('shop', 'product_code')
 
     def save(self, *args, **kwargs):
+        # Compress image if it exists
+        if self.image:
+            from .utils import compress_and_resize_image
+            self.image = compress_and_resize_image(
+                self.image,
+                target_size=(300, 300),
+                target_format='WEBP',
+                max_size_kb=50,
+                min_size_kb=10,
+                target_size_kb=30
+            )
+        
         if self.selling_price is None:
             self.selling_price = max(0, self.regular_price - (self.discount or 0))
         super().save(*args, **kwargs)
